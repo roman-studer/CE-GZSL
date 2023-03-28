@@ -8,6 +8,7 @@ import h5py
 import os
 from logger import create_logger
 import datetime
+import pickle
 
 
 def initialize_exp(path, name):
@@ -62,9 +63,70 @@ class Logger(object):
 		f.close()
 
 
+class EarlyStopping(object):
+	"""Early stops the training if validation loss doesn't improve after a given patience."""
+
+	def __init__(self, opt, verbose=False, maximize=True):
+		"""
+		Args:
+			patience (int): How long to wait after last time validation loss improved.
+							Default: 7
+			verbose (bool): If True, prints a message for each validation loss improvement.
+							Default: False
+			delta (float): Minimum change in the monitored quantity to qualify as an improvement.
+							Default: 0
+			maximize (bool): If True, the monitored quantity is maximized, otherwise it is minimized.
+		"""
+		self.patience = opt.early_stop_patience
+		self.verbose = verbose
+		self.counter = 0
+		self.best_score = None
+		self.early_stop = False
+		self.val_loss_min = np.Inf
+		self.delta = opt.early_stop_min_delta
+		self.maximize = maximize
+
+	def __call__(self, val_loss, model, opt):
+
+		score = -val_loss if self.maximize else val_loss
+
+		if self.best_score is None:
+			self.best_score = score
+		elif score < self.best_score + self.delta:
+			self.counter += 1
+			print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+			if self.counter >= self.patience:
+				self.early_stop = True
+		else:
+			self.best_score = score
+			self.save_checkpoint(val_loss, model, opt)
+			self.counter = 0
+
+	def save_checkpoint(self, val_loss, model, opt):
+		'''Saves model when validation loss decrease.'''
+		if self.verbose:
+			print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
+		if opt.save_best_model:
+			torch.save(model.state_dict(), f'./models/{opt.dataset}/checkpoint_{opt.wandb_name}.pt')
+
+
+def get_pollen_data(opt):
+	# load pollen data from pickle file
+	if opt.subset:
+		path = opt.dataroot + '/' + opt.dataset + '/pollen_data_subset.pkl'
+	else:
+		path = opt.dataroot + '/' + opt.dataset + '/pollen_data.pkl'
+
+	with open(path, 'rb') as f:
+		data = pickle.load(f)
+	return data
+
+
 class DATA_LOADER(object):
 	def __init__(self, opt):
-		if opt.matdataset:
+		if opt.dataset == 'POLLEN':
+			self.read_pollen_data(opt)
+		elif opt.matdataset:
 			if opt.dataset == 'imagenet':
 				self.read_matimagenet(opt)
 			else:
@@ -241,6 +303,76 @@ class DATA_LOADER(object):
 		# pdb.set_trace()
 
 		# self.train_mapped_label = map_label(self.train_label, self.seenclasses)
+
+	def read_pollen_data(self, opt):
+		matcontent = get_pollen_data(opt)
+		feature = matcontent['features']
+		self.all_file = matcontent['image_files']
+		label = matcontent['labels'].astype(int).squeeze()
+
+		# numpy array index starts from 0, matlab starts from 1
+		trainval_loc = matcontent['trainval_loc'].squeeze()
+		train_loc = matcontent['train_loc'].squeeze()
+		val_unseen_loc = matcontent['val_loc'].squeeze()
+		test_seen_loc = matcontent['test_seen_loc'].squeeze()
+		test_unseen_loc = matcontent['test_unseen_loc'].squeeze()
+
+		self.attribute = torch.from_numpy(matcontent['att'].T).float()
+		if not opt.validation:
+			self.train_image_file = self.all_file[trainval_loc]
+			self.test_seen_image_file = self.all_file[test_seen_loc]
+			self.test_unseen_image_file = self.all_file[test_unseen_loc]
+
+			if opt.preprocessing:
+				if opt.standardization:
+					print('standardization...')
+					scaler = preprocessing.StandardScaler()
+				else:
+					scaler = preprocessing.MinMaxScaler()
+
+				_train_feature = scaler.fit_transform(feature[trainval_loc])
+				_test_seen_feature = scaler.transform(feature[test_seen_loc])
+				_test_unseen_feature = scaler.transform(feature[test_unseen_loc])
+				self.train_feature = torch.from_numpy(_train_feature).float()
+				mx = self.train_feature.max()
+				self.train_feature.mul_(1 / mx)
+				self.train_label = torch.from_numpy(label[trainval_loc]).long()
+				self.test_unseen_feature = torch.from_numpy(_test_unseen_feature).float()
+				self.test_unseen_feature.mul_(1 / mx)
+				self.test_unseen_label = torch.from_numpy(label[test_unseen_loc]).long()
+				self.test_seen_feature = torch.from_numpy(_test_seen_feature).float()
+				self.test_seen_feature.mul_(1 / mx)
+				self.test_seen_label = torch.from_numpy(label[test_seen_loc]).long()
+			else:
+				self.train_feature = torch.from_numpy(feature[trainval_loc]).float()
+				self.train_label = torch.from_numpy(label[trainval_loc]).long()
+				self.test_unseen_feature = torch.from_numpy(feature[test_unseen_loc]).float()
+				self.test_unseen_label = torch.from_numpy(label[test_unseen_loc]).long()
+				self.test_seen_feature = torch.from_numpy(feature[test_seen_loc]).float()
+				self.test_seen_label = torch.from_numpy(label[test_seen_loc]).long()
+		else:
+			self.train_feature = torch.from_numpy(feature[train_loc]).float()
+			self.train_label = torch.from_numpy(label[train_loc]).long()
+			self.test_unseen_feature = torch.from_numpy(feature[val_unseen_loc]).float()
+			self.test_unseen_label = torch.from_numpy(label[val_unseen_loc]).long()
+
+		self.seenclasses = torch.from_numpy(np.unique(self.train_label.numpy()))
+		self.unseenclasses = torch.from_numpy(np.unique(self.test_unseen_label.numpy()))
+		self.ntrain = self.train_feature.size()[0]
+		self.ntrain_class = self.seenclasses.size(0)
+		self.ntest_class = self.unseenclasses.size(0)
+		self.train_class = self.seenclasses.clone()
+		self.allclasses = torch.arange(0, self.ntrain_class + self.ntest_class).long()
+		self.attribute_seen = self.attribute[self.seenclasses]
+
+		# collect the data of each class
+
+		self.train_samples_class_index = torch.tensor([self.train_label.eq(i_class).sum().float() for i_class in self.train_class])
+	#
+	# import pdb
+	# pdb.set_trace()
+
+	# self.train_mapped_label = map_label(self.train_label, self.seenclasses)
 
 	def next_batch_one_class(self, batch_size):
 		if self.index_in_epoch == self.ntrain_class:

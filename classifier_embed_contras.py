@@ -24,7 +24,7 @@ class CLASSIFIER:
         self.nclass = _nclass
         self.input_dim = embed_size
         self.cuda = _cuda
-        self.model =  LINEAR_LOGSOFTMAX(self.input_dim, self.nclass)
+        self.model = LINEAR_LOGSOFTMAX(self.input_dim, self.nclass)
         self.model.apply(util.weights_init)
         self.criterion = nn.NLLLoss()
         
@@ -90,17 +90,20 @@ class CLASSIFIER:
 
                 loss.backward()
                 self.optimizer.step()
-            acc_seen = self.val_gzsl(self.test_seen_feature, self.test_seen_label, self.seenclasses)
-            acc_unseen = self.val_gzsl(self.test_unseen_feature, self.test_unseen_label, self.unseenclasses)
-            if (acc_seen+acc_unseen)==0:
+            acc_seen = self.val_gzsl(self.test_seen_feature, self.test_seen_label, self.seenclasses) + 0.0001
+            acc_unseen = self.val_gzsl(self.test_unseen_feature, self.test_unseen_label, self.unseenclasses) + 0.0001
+            if (acc_seen+acc_unseen)==0.:
                 print('a bug')
                 H=0
             else:
                 H = 2*acc_seen*acc_unseen / (acc_seen+acc_unseen)
+
             if H > best_H:
-                best_seen = acc_seen
-                best_unseen = acc_unseen
                 best_H = H
+            if acc_seen > best_seen:
+                best_seen = acc_seen
+            if acc_unseen > best_unseen:
+                best_unseen = acc_unseen
         return best_seen, best_unseen, best_H
                      
     def next_batch(self, batch_size):
@@ -155,7 +158,6 @@ class CLASSIFIER:
                     output = self.model(embed)
             _, predicted_label[start:end] = torch.max(output, 1)
             start = end
-
         acc = self.compute_per_class_acc_gzsl(test_label, predicted_label, target_classes)
         return acc
 
@@ -193,6 +195,7 @@ class CLASSIFIER:
             idx = (test_label == i)
             acc_per_class[i] = float(torch.sum(test_label[idx]==predicted_label[idx])) / float(torch.sum(idx))
         return acc_per_class.mean() 
+
 
 class LINEAR_LOGSOFTMAX(nn.Module):
     def __init__(self, input_dim, nclass):

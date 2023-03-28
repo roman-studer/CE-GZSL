@@ -1,6 +1,7 @@
 from __future__ import print_function
 import argparse
 import sys
+
 sys.path.append("..")
 import os
 import random
@@ -16,6 +17,9 @@ import classifier_embed_contras
 import model
 import losses
 import torch.nn.functional as F
+from wandb_logging import WandBLogger
+import uuid
+import itertools
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', default='POLLEN', help='FLO')
@@ -23,43 +27,68 @@ parser.add_argument('--dataroot', default='./data', help='path to dataset')
 parser.add_argument('--matdataset', default=False, help='Data in matlab format')
 parser.add_argument('--image_embedding', default='res101')
 parser.add_argument('--class_embedding', default='sent', help='att or sent')
-parser.add_argument('--syn_num', type=int, default=62, help='number features to generate per class')
+parser.add_argument('--syn_num', type=int, default=6, help='number features to generate per class')
 parser.add_argument('--gzsl', type=bool, default=True, help='enable generalized zero-shot learning')
-parser.add_argument('--preprocessing', type=bool, default=True, help='enable MinMaxScaler on visual features')
+parser.add_argument('--preprocessing', type=bool, default=False, help='enbale MinMaxScaler on visual features')
 parser.add_argument('--standardization', action='store_true', default=False)
 parser.add_argument('--validation', action='store_true', default=False, help='enable cross validation mode')
 parser.add_argument('--workers', type=int, help='number of data loading workers', default=2)
-parser.add_argument('--batch_size', type=int, default=2048, help='input batch size')
-parser.add_argument('--resSize', type=int, default=2048, help='size of visual features')
-parser.add_argument('--attSize', type=int, default=62, help='size of semantic features')
-parser.add_argument('--nz', type=int, default=1024, help='noise for generation')
-parser.add_argument('--embedSize', type=int, default=768, help='size of embedding h')
-parser.add_argument('--outzSize', type=int, default=512, help='size of non-liner projection z')
+parser.add_argument('--batch_size', type=int, default=256, help='input batch size')
+parser.add_argument('--resSize', type=int, default=6, help='size of visual features')
+parser.add_argument('--attSize', type=int, default=6, help='size of semantic features')
+parser.add_argument('--nz', type=int, default=6, help='noise for generation')
+parser.add_argument('--embedSize', type=int, default=12, help='size of embedding h')
+parser.add_argument('--outzSize', type=int, default=6, help='size of non-liner projection z')
 
 ## network architechure
-parser.add_argument('--ngh', type=int, default=4096, help='size of the hidden units in generator G')
-parser.add_argument('--ndh', type=int, default=4096, help='size of the hidden units in discriminator D')
-parser.add_argument('--nhF', type=int, default=2048, help='size of the hidden units comparator network F')
+parser.add_argument('--ngh', type=int, default=48, help='size of the hidden units in generator G')
+parser.add_argument('--ndh', type=int, default=48, help='size of the hidden units in discriminator D')
+parser.add_argument('--nhF', type=int, default=24, help='size of the hidden units comparator network F')
 
 parser.add_argument('--ins_weight', type=float, default=0.001, help='weight of the classification loss when learning G')
 parser.add_argument('--cls_weight', type=float, default=0.001, help='weight of the score function when learning G')
 parser.add_argument('--ins_temp', type=float, default=0.1, help='temperature in instance-level supervision')
 parser.add_argument('--cls_temp', type=float, default=0.1, help='temperature in class-level supervision')
 
-parser.add_argument('--nepoch', type=int, default=2000, help='number of epochs to train for')
+parser.add_argument('--nepoch', type=int, default=200, help='number of epochs to train for')
 parser.add_argument('--critic_iter', type=int, default=5, help='critic iteration, following WGAN-GP')
-parser.add_argument('--lr', type=float, default=0.0004, help='learning rate to training')
-parser.add_argument('--lr_decay_epoch', type=int, default=20, help='conduct learning rate decay after every 100 epochs')
-parser.add_argument('--lr_dec_rate', type=float, default=0.95, help='learning rate decay rate')
+parser.add_argument('--lr', type=float, default=0.001, help='learning rate to training')
+parser.add_argument('--lr_decay_epoch', type=int, default=100,
+                    help='conduct learning rate decay after every 100 epochs')
+parser.add_argument('--lr_dec_rate', type=float, default=0.99, help='learning rate decay rate')
 parser.add_argument('--lambda1', type=float, default=10, help='gradient penalty regularizer, following WGAN-GP')
-parser.add_argument('--classifier_lr', type=float, default=0.004, help='learning rate to train softmax classifier')
+parser.add_argument('--classifier_lr', type=float, default=0.001, help='learning rate to train softmax classifier')
 parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam. default=0.5')
 parser.add_argument('--cuda', action='store_true', default=True, help='enables cuda')
-parser.add_argument('--manualSeed', type=int, default=3483, help='manual seed')
-parser.add_argument('--nclass_all', type=int, default=16, help='number of all classes')
-parser.add_argument('--nclass_seen', type=int, default=14, help='number of all classes')
+parser.add_argument('--manualSeed', type=int, default=69, help='manual seed')
+parser.add_argument('--nclass_all', type=int, default=14, help='number of all classes')
+parser.add_argument('--nclass_seen', type=int, default=12, help='number of all classes')
 
 parser.add_argument('--gpus', default='0', help='the number of the GPU to use')
+
+parser.add_argument('--use_early_stop', action='store_true', default=False)
+parser.add_argument('--early_stop_patience', type=int, default=10)
+parser.add_argument('--early_stop_min_delta', type=float, default=0.001)
+parser.add_argument('--early_stop_metric', type=str, default='acc_GZSL_H', help='metric to use for early stopping')
+parser.add_argument('--early_stop_mode', type=str, default='max', help='mode for early stopping (min or max)')
+
+parser.add_argument('--use_lr_scheduler', action='store_true', default=False)
+parser.add_argument('--lr_scheduler_patience', type=int, default=10)
+parser.add_argument('--lr_scheduler_factor', type=float, default=0.01)
+
+parser.add_argument('--save_best_model', action='store_true', default=False)
+parser.add_argument('--save_best_model_metric', type=str, default='acc_GZSL_H', help='metric to save best model')
+
+parser.add_argument('--subset', action='store_true', default=True, help='use subset of data')
+
+# wandb logging
+identifier = str(uuid.uuid4().hex)
+parser.add_argument('--wandb', action='store_true', default=True, help='logs results during training to wandb')
+parser.add_argument('--wandb_name', type=str, default='test_' + identifier, help='name of the wandb run')
+parser.add_argument('--wandb_project', type=str, default='apollo_zsl_ce', help='name of the wandb project')
+parser.add_argument('--wandb_entity', type=str, default='biocycle', help='name of the wandb entity')
+
+
 opt = parser.parse_args()
 print(opt)
 
@@ -91,12 +120,11 @@ model_path = './models/' + opt.dataset
 if not os.path.exists(model_path):
     os.makedirs(model_path)
 
-if len(opt.gpus.split(','))>1:
-    netG=nn.DataParallel(netG)
+if len(opt.gpus.split(',')) > 1:
+    netG = nn.DataParallel(netG)
     netD = nn.DataParallel(netD)
     netMap = nn.DataParallel(netMap)
     F_ha = nn.DataParallel(F_ha)
-
 
 contras_criterion = losses.SupConLoss_clear(opt.ins_temp)
 
@@ -145,11 +173,15 @@ def generate_syn_feature(netG, classes, attribute, num):
 
 
 # setup optimizer
-import itertools
 
-optimizerD = optim.Adam(itertools.chain(netD.parameters(), netMap.parameters(), F_ha.parameters()), lr=opt.lr,
-                        betas=(opt.beta1, 0.999))
-optimizerG = optim.Adam(netG.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
+
+optimizerD = optim.AdamW(itertools.chain(netD.parameters(), netMap.parameters(), F_ha.parameters()), lr=opt.lr,
+                         betas=(opt.beta1, 0.999))
+optimizerG = optim.AdamW(netG.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
+
+if opt.use_lr_scheduler:
+    schedulerD = optim.lr_scheduler.StepLR(optimizerD, step_size=opt.lr_scheduler_patience, gamma=opt.lr_scheduler_factor)
+    schedulerG = optim.lr_scheduler.StepLR(optimizerG, step_size=opt.lr_scheduler_patience, gamma=opt.lr_scheduler_factor)
 
 def calc_gradient_penalty(netD, real_data, fake_data, input_att):
     # print real_data.size()
@@ -171,12 +203,14 @@ def calc_gradient_penalty(netD, real_data, fake_data, input_att):
     gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * opt.lambda1
     return gradient_penalty
 
+
 # use the for-loop to save the GPU-memory
 def class_scores_for_loop(embed, input_label, relation_net):
-    all_scores=torch.FloatTensor(embed.shape[0],opt.nclass_seen).cuda()
+    all_scores = torch.FloatTensor(embed.shape[0], opt.nclass_seen).cuda()
     for i, i_embed in enumerate(embed):
-        expand_embed = i_embed.repeat(opt.nclass_seen, 1)#.reshape(embed.shape[0] * opt.nclass_seen, -1)
-        all_scores[i] = (torch.div(relation_net(torch.cat((expand_embed, data.attribute_seen.cuda()), dim=1)),opt.cls_temp).squeeze())
+        expand_embed = i_embed.repeat(opt.nclass_seen, 1)  # .reshape(embed.shape[0] * opt.nclass_seen, -1)
+        all_scores[i] = (torch.div(relation_net(torch.cat((expand_embed, data.attribute_seen.cuda()), dim=1)),
+                                   opt.cls_temp).squeeze())
     score_max, _ = torch.max(all_scores, dim=1, keepdim=True)
     # normalize the scores for stable training
     scores_norm = all_scores - score_max.detach()
@@ -186,13 +220,15 @@ def class_scores_for_loop(embed, input_label, relation_net):
     cls_loss = -((mask * log_scores).sum(1) / mask.sum(1)).mean()
     return cls_loss
 
+
 # It is much faster to use the matrix, but it cost much GPU memory.
 def class_scores_in_matrix(embed, input_label, relation_net):
     expand_embed = embed.unsqueeze(dim=1).repeat(1, opt.nclass_seen, 1).reshape(embed.shape[0] * opt.nclass_seen, -1)
     expand_att = data.attribute_seen.unsqueeze(dim=0).repeat(embed.shape[0], 1, 1).reshape(
         embed.shape[0] * opt.nclass_seen, -1).cuda()
-    all_scores = torch.div(relation_net(torch.cat((expand_embed, expand_att), dim=1)),opt.cls_temp).reshape(embed.shape[0],
-                                                                                                    opt.nclass_seen)
+    all_scores = torch.div(relation_net(torch.cat((expand_embed, expand_att), dim=1)), opt.cls_temp).reshape(
+        embed.shape[0],
+        opt.nclass_seen)
     score_max, _ = torch.max(all_scores, dim=1, keepdim=True)
     scores_norm = all_scores - score_max.detach()
     mask = F.one_hot(input_label, num_classes=opt.nclass_seen).float().cuda()
@@ -202,6 +238,14 @@ def class_scores_in_matrix(embed, input_label, relation_net):
     return cls_loss
 
 
+logger = WandBLogger(opt)
+logger.log_config(opt)
+
+# early stopping
+if opt.use_early_stop:
+    early_stopping = util.EarlyStopping(opt, verbose=True, maximize=opt.early_stop_mode)
+
+best_acc_unseen = None
 for epoch in range(opt.nepoch):
     FP = 0
     mean_lossD = 0
@@ -249,7 +293,11 @@ for epoch in range(opt.nepoch):
             D_cost = criticD_fake - criticD_real + gradient_penalty + real_ins_contras_loss + cls_loss_real
 
             D_cost.backward()
-            optimizerD.step()
+
+            if opt.use_lr_scheduler:
+                schedulerD.step()
+            else:
+                optimizerD.step()
         ############################
         # (2) Update G network: optimize WGAN-GP objective, Equation (2)
         ###########################
@@ -281,20 +329,31 @@ for epoch in range(opt.nepoch):
         errG = G_cost + opt.ins_weight * fake_ins_contras_loss + opt.cls_weight * cls_loss_fake  # + opt.ins_weight * c_errG
 
         errG.backward()
-        optimizerG.step()
+
+        if opt.use_lr_scheduler:
+            schedulerG.step()
+        else:
+            optimizerG.step()
 
     F_ha.zero_grad()
-    if (epoch + 1) % opt.lr_decay_epoch == 0:
-        for param_group in optimizerD.param_groups:
-            param_group['lr'] = param_group['lr'] * opt.lr_dec_rate
-        for param_group in optimizerG.param_groups:
-            param_group['lr'] = param_group['lr'] * opt.lr_dec_rate
+    if opt.use_lr_scheduler is False:
+        if (epoch + 1) % opt.lr_decay_epoch == 0:
+            for param_group in optimizerD.param_groups:
+                param_group['lr'] = param_group['lr'] * opt.lr_dec_rate
+            for param_group in optimizerG.param_groups:
+                param_group['lr'] = param_group['lr'] * opt.lr_dec_rate
 
     mean_lossG /= data.ntrain / opt.batch_size
     mean_lossD /= data.ntrain / opt.batch_size
     print(
         '[%d/%d] Loss_D: %.4f Loss_G: %.4f, Wasserstein_dist: %.4f, real_ins_contras_loss:%.4f, fake_ins_contras_loss:%.4f, cls_loss_real: %.4f, cls_loss_fake: %.4f'
-        % (epoch, opt.nepoch, D_cost, G_cost, Wasserstein_D, real_ins_contras_loss, fake_ins_contras_loss, cls_loss_real, cls_loss_fake))
+        % (
+        epoch, opt.nepoch, D_cost, G_cost, Wasserstein_D, real_ins_contras_loss, fake_ins_contras_loss, cls_loss_real,
+        cls_loss_fake))
+
+    logger.log_metrics({'lossD': D_cost, 'lossG': G_cost, 'Wasserstein_dist': Wasserstein_D,
+                        'real_ins_contras_loss': real_ins_contras_loss, 'fake_ins_contras_loss': fake_ins_contras_loss,
+                        'cls_loss_real': cls_loss_real, 'cls_loss_fake': cls_loss_fake}, step=epoch)
 
     # evaluate the model, set G to evaluation mode
     netG.eval()
@@ -302,7 +361,7 @@ for epoch in range(opt.nepoch):
     for p in netMap.parameters():  # reset requires_grad
         p.requires_grad = False
 
-    if opt.gzsl: # Generalized zero-shot learning
+    if opt.gzsl:  # Generalized zero-shot learning
         syn_feature, syn_label = generate_syn_feature(netG, data.unseenclasses, data.attribute, opt.syn_num)
         train_X = torch.cat((data.train_feature, syn_feature), 0)
         train_Y = torch.cat((data.train_label, syn_label), 0)
@@ -312,6 +371,33 @@ for epoch in range(opt.nepoch):
                                                   opt.classifier_lr, 0.5, 25, opt.syn_num,
                                                   True)
         print('unseen=%.4f, seen=%.4f, h=%.4f' % (cls.acc_unseen, cls.acc_seen, cls.H))
+        logger.log_metrics({'gzsl_acc_unseen': cls.acc_unseen, 'gzsl_acc_seen': cls.acc_seen, 'h': cls.H}, step=epoch)
+
+        if best_acc_unseen is None:
+            best_acc_unseen = cls.acc_unseen
+
+        if cls.acc_unseen > best_acc_unseen:
+            best_acc_unseen = cls.acc_unseen
+            best_acc_seen = cls.acc_seen
+            best_H = cls.H
+            best_epoch = epoch
+            if opt.save_best_model:
+                torch.save(netG.state_dict(), model_path + '/netG_epoch_%d_%s.pth' % (epoch, identifier))
+                torch.save(netD.state_dict(), model_path + '/netD_epoch_%d_%s.pth' % (epoch, identifier))
+                torch.save(netMap.state_dict(), model_path + '/netMap_epoch_%d_%s.pth' % (epoch, identifier))
+                torch.save(F_ha.state_dict(), model_path + '/F_ha_epoch_%d_%s.pth' % (epoch, identifier))
+            print('best unseen=%.4f, seen=%.4f, h=%.4f' % (best_acc_unseen, best_acc_seen, best_H))
+            logger.log_metrics(
+                {'best_gzsl_acc_unseen': best_acc_unseen, 'best_gzsl_acc_seen': best_acc_seen, 'best_h': best_H},
+                step=epoch)
+
+        if opt.use_early_stop:
+            early_stopping(cls.H, netG, opt)
+            if early_stopping.early_stop:
+                logger.log_config({'early_stop': True})
+                logger.finish()
+                print("Early stopping")
+                sys.exit()
 
     else:  # conventional zero-shot learning
         syn_feature, syn_label = generate_syn_feature(netG, data.unseenclasses, data.attribute, opt.syn_num)
@@ -321,11 +407,46 @@ for epoch in range(opt.nepoch):
                                                   opt.syn_num,
                                                   False)
         acc = cls.acc
-        print('unseen class accuracy=%.4f '%acc)
+        print('unseen class accuracy=%.4f ' % acc)
+        logger.log_metrics({'gzsl_acc_unseen': acc}, step=epoch)
 
+        if best_acc_unseen is None:
+            best_acc_unseen = cls.acc_unseen
+
+        if cls.acc_unseen > best_acc_unseen:
+            best_acc_unseen = cls.acc_unseen
+            best_acc_seen = cls.acc_seen
+            best_H = cls.H
+            best_epoch = epoch
+        if opt.save_best_model:
+            torch.save(netG.state_dict(), model_path + '/netG_epoch_%d_%s.pth' % (epoch, identifier))
+            torch.save(netD.state_dict(), model_path + '/netD_epoch_%d_%s.pth' % (epoch, identifier))
+            torch.save(netMap.state_dict(), model_path + '/netMap_epoch_%d_%s.pth' % (epoch, identifier))
+            torch.save(F_ha.state_dict(), model_path + '/F_ha_epoch_%d_%s.pth' % (epoch, identifier))
+        print('best unseen=%.4f, seen=%.4f, h=%.4f' % (best_acc_unseen, best_acc_seen, best_H))
+        logger.log_metrics(
+                {'best_zsl_acc_unseen': best_acc_unseen, 'best_zsl_acc_seen': best_acc_seen, 'best_h': best_H},
+                step=epoch)
+
+        if opt.use_early_stop:
+            early_stopping(cls.H, netG, opt)
+            if early_stopping.early_stop:
+                logger.log_config({'early_stop': True})
+                logger.finish()
+                print("Early stopping")
+                sys.exit()
 
     # reset G to training mode
     netG.train()
     for p in netMap.parameters():  # reset requires_grad
         p.requires_grad = True
+
+    # save checkpoint if accuracy improves
+    if cls.acc_unseen > best_acc_unseen:
+        best_h = cls.H
+        if opt.save_best_model:
+            torch.save(netG.state_dict(), model_path + '/netG_epoch_%d_%s.pth' % (epoch, identifier))
+            torch.save(netD.state_dict(), model_path + '/netD_epoch_%d_%s.pth' % (epoch, identifier))
+            torch.save(netMap.state_dict(), model_path + '/netMap_epoch_%d_%s.pth' % (epoch, identifier))
+            torch.save(F_ha.state_dict(), model_path + '/F_ha_epoch_%d_%s.pth' % (epoch, identifier))
 
